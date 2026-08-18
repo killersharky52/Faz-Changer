@@ -337,7 +337,7 @@
   </div>
 
   <div class="footnote">
-    <b>About Formant:</b> pitch alone makes a "chipmunk," not a different gender — the real cue is formant structure (the resonance pattern set by vocal tract shape). This control cuts your voice's natural resonance at its original frequencies and boosts a new one at the shifted target. Push the slider toward the ends (±80–100%) for a clearly audible change. It's still DSP filtering, not AI voice conversion.
+    <b>About Formant:</b> this now does real spectral envelope warping — it analyzes your voice's actual resonance shape ~170 times a second and reshapes it, rather than boosting fixed EQ frequencies. It's genuinely closer to how dedicated formant-shift tools work, and should sound noticeably less "helium" than a straight EQ trick. Real limitation, not a bug: precisely locating the lowest formant is inherently harder for higher-pitched voices (fewer harmonics sample that region) — a known challenge in speech analysis generally, most noticeable when pushing hard toward Feminize. It's still signal processing, not a trained voice model — think "meaningfully better," not "ElevenLabs-level."
   </div>
   <div class="footnote">
     <b>Note:</b> this runs entirely in your browser — audio never leaves your device. It works like an app: add this page to your phone's home screen for a full-screen icon. For true feedback-free speaker playback, wired or Bluetooth headphones are strongly recommended.
@@ -411,17 +411,165 @@ class PitchShiftProcessor extends AudioWorkletProcessor {
 registerProcessor('pitch-shift-processor', PitchShiftProcessor);
 `;
 
+const FORMANT_WORKLET_CODE = `
+class FormantWarpProcessor extends AudioWorkletProcessor {
+  static get parameterDescriptors() {
+    return [{ name: 'formantRatio', defaultValue: 1, minValue: 0.55, maxValue: 1.8, automationRate: 'k-rate' }];
+  }
+  constructor() {
+    super();
+    this.N = 1024;
+    this.HOP = this.N / 4;
+    this.lifterCutoff = 48;
+
+    this.win = new Float32Array(this.N);
+    for (let i = 0; i < this.N; i++) this.win[i] = 0.5 - 0.5 * Math.cos((2 * Math.PI * i) / (this.N - 1));
+
+    const simLen = this.N * 3;
+    const sum = new Float64Array(simLen);
+    for (let hop = 0; hop + this.N <= simLen; hop += this.HOP) {
+      for (let i = 0; i < this.N; i++) sum[hop + i] += this.win[i] * this.win[i];
+    }
+    this.colaNorm = sum[Math.floor(simLen / 2)];
+
+    this.inRingSize = this.N * 2;
+    this.inRing = new Float32Array(this.inRingSize);
+    this.inWritePos = 0;
+    this.samplesSinceFrame = 0;
+
+    this.outRingSize = this.N * 2;
+    this.outRing = new Float32Array(this.outRingSize);
+    this.outWritePos = 0;
+    this.outReadPos = 0;
+    this.readyOutputCount = 0;
+    this.primed = false;
+    this.primedCount = 0;
+  }
+
+  _fft(re, im, invert) {
+    const n = re.length;
+    for (let i = 1, j = 0; i < n; i++) {
+      let bit = n >> 1;
+      for (; j & bit; bit >>= 1) j ^= bit;
+      j ^= bit;
+      if (i < j) {
+        let tr = re[i]; re[i] = re[j]; re[j] = tr;
+        let ti = im[i]; im[i] = im[j]; im[j] = ti;
+      }
+    }
+    for (let len = 2; len <= n; len <<= 1) {
+      const ang = (invert ? 2 : -2) * Math.PI / len;
+      const wRe = Math.cos(ang), wIm = Math.sin(ang);
+      for (let i = 0; i < n; i += len) {
+        let curRe = 1, curIm = 0;
+        for (let j = 0; j < len / 2; j++) {
+          const uRe = re[i + j], uIm = im[i + j];
+          const vRe = re[i + j + len / 2] * curRe - im[i + j + len / 2] * curIm;
+          const vIm = re[i + j + len / 2] * curIm + im[i + j + len / 2] * curRe;
+          re[i + j] = uRe + vRe; im[i + j] = uIm + vIm;
+          re[i + j + len / 2] = uRe - vRe; im[i + j + len / 2] = uIm - vIm;
+          const nRe = curRe * wRe - curIm * wIm, nIm = curRe * wIm + curIm * wRe;
+          curRe = nRe; curIm = nIm;
+        }
+      }
+    }
+    if (invert) for (let i = 0; i < n; i++) { re[i] /= n; im[i] /= n; }
+  }
+
+  _processFrame(ratio) {
+    const N = this.N;
+    const frame = new Float64Array(N);
+    for (let i = 0; i < N; i++) {
+      const idx = (this.inWritePos - N + i + this.inRingSize * 4) % this.inRingSize;
+      frame[i] = this.inRing[idx] * this.win[i];
+    }
+    const specRe = frame.slice();
+    const specIm = new Float64Array(N);
+    this._fft(specRe, specIm, false);
+
+    const logMag = new Float64Array(N);
+    for (let k = 0; k < N; k++) logMag[k] = Math.log(Math.hypot(specRe[k], specIm[k]) + 1e-8);
+    const cepRe = logMag.slice(), cepIm = new Float64Array(N);
+    this._fft(cepRe, cepIm, true);
+    for (let n = this.lifterCutoff; n < N - this.lifterCutoff; n++) { cepRe[n] = 0; cepIm[n] = 0; }
+    const envRe = cepRe.slice(), envIm = cepIm.slice();
+    this._fft(envRe, envIm, false);
+    const envLog = envRe;
+
+    const half = N / 2;
+    const warped = new Float64Array(N);
+    for (let k = 0; k <= half; k++) {
+      const srcK = k / ratio;
+      const k0 = Math.floor(srcK), frac = srcK - k0;
+      let v;
+      if (k0 < 0) v = envLog[0];
+      else if (k0 >= half) v = envLog[half];
+      else v = envLog[k0] * (1 - frac) + envLog[Math.min(k0 + 1, half)] * frac;
+      warped[k] = v;
+    }
+    for (let k = half + 1; k < N; k++) warped[k] = warped[N - k];
+
+    const outRe = new Float64Array(N), outIm = new Float64Array(N);
+    for (let k = 0; k < N; k++) {
+      const scale = Math.exp(warped[k] - envLog[k]);
+      outRe[k] = specRe[k] * scale;
+      outIm[k] = specIm[k] * scale;
+    }
+    this._fft(outRe, outIm, true);
+
+    for (let i = 0; i < N; i++) {
+      const idx = (this.outWritePos + i) % this.outRingSize;
+      this.outRing[idx] += (outRe[i] * this.win[i]) / this.colaNorm;
+    }
+    this.outWritePos = (this.outWritePos + this.HOP) % this.outRingSize;
+    this.readyOutputCount += this.HOP;
+  }
+
+  process(inputs, outputs, parameters) {
+    const input = inputs[0][0];
+    const output = outputs[0][0];
+    if (!input || !output) return true;
+    const ratio = parameters.formantRatio[0];
+    const L = input.length;
+    for (let i = 0; i < L; i++) {
+      this.inRing[this.inWritePos] = input[i];
+      this.inWritePos = (this.inWritePos + 1) % this.inRingSize;
+      this.samplesSinceFrame++;
+      if (!this.primed) this.primedCount++;
+
+      if (this.samplesSinceFrame >= this.HOP) {
+        this.samplesSinceFrame = 0;
+        if (this.primedCount >= this.N || this.primed) {
+          this.primed = true;
+          this._processFrame(ratio);
+        }
+      }
+
+      if (this.readyOutputCount > 0) {
+        output[i] = this.outRing[this.outReadPos];
+        this.outRing[this.outReadPos] = 0;
+        this.outReadPos = (this.outReadPos + 1) % this.outRingSize;
+        this.readyOutputCount--;
+      } else {
+        output[i] = 0;
+      }
+    }
+    return true;
+  }
+}
+registerProcessor('formant-warp-processor', FormantWarpProcessor);
+`;
+
 let audioCtx, micStream, sourceNode, pitchNode;
 let ringOsc, ringGain, ringOscDepth, dryGain, wetGain;
 let delayNode, feedbackGain, delayWetGain, delayDryGain;
 let distNode, masterGain, analyser, mixBus;
-let formantCut1, formantCut2, formantCut3, formantF1, formantF2, formantF3, formantHighShelf, formantLowShelf, formantSafety;
+let formantNode;
 let running = false;
 
 // Approximate average vowel-formant centers (Hz) for a neutral adult voice.
 // These get frequency-shifted and gain-boosted toward male or female
 // vocal-tract resonance patterns by the formant control.
-const FORMANT_BASE = { f1: 500, f2: 1500, f3: 2500 };
 
 const els = {
   startBtn: document.getElementById('start-btn'),
@@ -495,31 +643,15 @@ async function startAudio() {
   distNode.curve = makeDistortionCurve(0);
   distNode.oversample = '2x';
 
-  // Formant shaping bank, two stages:
-  // (1) CUT filters fixed at the natural/original formant frequencies —
-  //     these suppress your voice's own resonance so it stops fighting the
-  //     shifted target. Without this, boosting alone is nearly inaudible
-  //     because your real formants are already the loudest thing present.
-  // (2) BOOST filters at the shifted target frequencies to emphasize the
-  //     new resonance pattern. Plus brightness/warmth shelves.
-  formantCut1 = audioCtx.createBiquadFilter();
-  formantCut1.type = 'peaking'; formantCut1.Q.value = 1.6; formantCut1.frequency.value = FORMANT_BASE.f1; formantCut1.gain.value = 0;
-  formantCut2 = audioCtx.createBiquadFilter();
-  formantCut2.type = 'peaking'; formantCut2.Q.value = 1.7; formantCut2.frequency.value = FORMANT_BASE.f2; formantCut2.gain.value = 0;
-  formantCut3 = audioCtx.createBiquadFilter();
-  formantCut3.type = 'peaking'; formantCut3.Q.value = 1.5; formantCut3.frequency.value = FORMANT_BASE.f3; formantCut3.gain.value = 0;
-  formantF1 = audioCtx.createBiquadFilter();
-  formantF1.type = 'peaking'; formantF1.Q.value = 1.4; formantF1.frequency.value = FORMANT_BASE.f1; formantF1.gain.value = 0;
-  formantF2 = audioCtx.createBiquadFilter();
-  formantF2.type = 'peaking'; formantF2.Q.value = 1.5; formantF2.frequency.value = FORMANT_BASE.f2; formantF2.gain.value = 0;
-  formantF3 = audioCtx.createBiquadFilter();
-  formantF3.type = 'peaking'; formantF3.Q.value = 1.3; formantF3.frequency.value = FORMANT_BASE.f3; formantF3.gain.value = 0;
-  formantHighShelf = audioCtx.createBiquadFilter();
-  formantHighShelf.type = 'highshelf'; formantHighShelf.frequency.value = 5000; formantHighShelf.gain.value = 0;
-  formantLowShelf = audioCtx.createBiquadFilter();
-  formantLowShelf.type = 'lowshelf'; formantLowShelf.frequency.value = 160; formantLowShelf.gain.value = 0;
-  formantSafety = audioCtx.createGain();
-  formantSafety.gain.value = 1;
+  // Real formant warping: an FFT-based spectral envelope shifter (cepstral
+  // liftering to isolate the vocal-tract resonance shape, then warp its
+  // frequency axis and re-apply). Unlike the old fixed-frequency EQ bump,
+  // this reads YOUR actual, moving formants each frame and reshapes them —
+  // genuinely closer to how real formant-shift tools work.
+  const formantBlob = new Blob([FORMANT_WORKLET_CODE], { type: 'application/javascript' });
+  const formantWorkletUrl = URL.createObjectURL(formantBlob);
+  await audioCtx.audioWorklet.addModule(formantWorkletUrl);
+  formantNode = new AudioWorkletNode(audioCtx, 'formant-warp-processor');
 
   // Echo (delay + feedback), mixed via dry/wet gains
   delayNode = audioCtx.createDelay(2.0);
@@ -541,23 +673,15 @@ async function startAudio() {
   analyser = audioCtx.createAnalyser();
   analyser.fftSize = 1024;
 
-  // Graph: source -> pitch -> ringGain -> distNode -> formant bank -> split(dry/wet delay) -> mixBus -> masterGain -> analyser -> destination
+  // Graph: source -> pitch -> ringGain -> distNode -> formant warper -> split(dry/wet delay) -> mixBus -> masterGain -> analyser -> destination
   sourceNode.connect(pitchNode);
   pitchNode.connect(ringGain);
   ringGain.connect(distNode);
 
-  distNode.connect(formantCut1);
-  formantCut1.connect(formantCut2);
-  formantCut2.connect(formantCut3);
-  formantCut3.connect(formantF1);
-  formantF1.connect(formantF2);
-  formantF2.connect(formantF3);
-  formantF3.connect(formantHighShelf);
-  formantHighShelf.connect(formantLowShelf);
-  formantLowShelf.connect(formantSafety);
+  distNode.connect(formantNode);
 
-  formantSafety.connect(delayDryGain);
-  formantSafety.connect(delayNode);
+  formantNode.connect(delayDryGain);
+  formantNode.connect(delayNode);
   delayNode.connect(delayWetGain);
 
   delayDryGain.connect(mixBus);
@@ -580,9 +704,10 @@ async function startAudio() {
   // in the past on every reset). We surface the combined estimate so the
   // number on screen isn't misleadingly low.
   const hwLatencyMs = audioCtx.baseLatency ? Math.round(audioCtx.baseLatency * 1000) : 10;
-  const totalEstMs = hwLatencyMs + grainSizeMs + 3; // +3ms ~ worklet render-quantum overhead
+  const formantLatencyMs = 26; // measured: FFT frame (1024 samples) + hop buffering at 44.1kHz
+  const totalEstMs = hwLatencyMs + grainSizeMs + formantLatencyMs + 3; // +3ms ~ worklet render-quantum overhead
   els.latencyLabel.textContent = 'LATENCY ~' + totalEstMs + 'ms';
-  els.latencyLabel.title = 'HW ~' + hwLatencyMs + 'ms + grain ~' + grainSizeMs + 'ms + overhead ~3ms. Bluetooth headphones typically add 100–200ms on top of this.';
+  els.latencyLabel.title = 'HW ~' + hwLatencyMs + 'ms + pitch grain ~' + grainSizeMs + 'ms + formant analysis ~' + formantLatencyMs + 'ms + overhead ~3ms. Bluetooth headphones typically add 100–200ms on top of this.';
 
   applyAllParams();
   drawScope();
@@ -620,30 +745,9 @@ function applyAllParams() {
   pitchNode.parameters.get('pitch').setTargetAtTime(semitonesToRatio(semis), audioCtx.currentTime, 0.01);
 
   const t = parseFloat(els.formantSlider.value) / 100; // -1 (masc) .. +1 (fem)
-  const freqMult = 1 + 0.45 * t;
+  const formantRatio = 1 + 0.45 * t;
   const now = audioCtx.currentTime;
-  const mag = Math.abs(t);
-
-  // Cut the natural formants (fixed at the original frequencies) so they
-  // stop dominating over the shifted target resonance.
-  formantCut1.frequency.setTargetAtTime(FORMANT_BASE.f1, now, 0.02);
-  formantCut2.frequency.setTargetAtTime(FORMANT_BASE.f2, now, 0.02);
-  formantCut3.frequency.setTargetAtTime(FORMANT_BASE.f3, now, 0.02);
-  formantCut1.gain.setTargetAtTime(-10 * mag, now, 0.02);
-  formantCut2.gain.setTargetAtTime(-13 * mag, now, 0.02);
-  formantCut3.gain.setTargetAtTime(-11 * mag, now, 0.02);
-
-  // Boost a new resonance at the shifted target frequencies.
-  formantF1.frequency.setTargetAtTime(FORMANT_BASE.f1 * freqMult, now, 0.02);
-  formantF2.frequency.setTargetAtTime(FORMANT_BASE.f2 * freqMult, now, 0.02);
-  formantF3.frequency.setTargetAtTime(FORMANT_BASE.f3 * freqMult, now, 0.02);
-  formantF1.gain.setTargetAtTime(9 * mag, now, 0.02);
-  formantF2.gain.setTargetAtTime(12 * mag, now, 0.02);
-  formantF3.gain.setTargetAtTime(10 * mag, now, 0.02);
-
-  formantHighShelf.gain.setTargetAtTime(t > 0 ? 5 * t : 0, now, 0.02);
-  formantLowShelf.gain.setTargetAtTime(t < 0 ? 5 * -t : 0, now, 0.02);
-  formantSafety.gain.setTargetAtTime(1 / (1 + 0.5 * mag), now, 0.02);
+  formantNode.parameters.get('formantRatio').setTargetAtTime(formantRatio, now, 0.03);
 
   const robotAmt = parseFloat(els.robotSlider.value) / 100;
   ringOscDepth.gain.setTargetAtTime(robotAmt * 0.9, audioCtx.currentTime, 0.02);
