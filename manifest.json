@@ -2,7 +2,7 @@
   "name": "FAZ CHANGER",
   "short_name": "FAZ",
   "description": "Real-time voice processor — pitch, formant, robot, and echo effects, live through your microphone.",
-  "start_url": "./faz-changer.html",
+  "start_url": "./index.html",
   "display": "standalone",
   "orientation": "portrait",
   "background_color": "#0a0a0b",
